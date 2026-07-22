@@ -24,17 +24,19 @@
  *    5  RW               -> GND        (write-only, tie low)
  *    6  E                -> D11
  *    7-10 D0-D3          -> not connected (4-bit mode)
- *   11  D4               -> D5
- *   12  D5               -> D4
- *   13  D6               -> D3
- *   14  D7               -> D2
+ *   11  D4               -> D6
+ *   12  D5               -> D5
+ *   13  D6               -> D4
+ *   14  D7               -> D3
  *   15  A  (backlight +) -> 5V through a 220 ohm resistor
  *   16  K  (backlight -) -> GND
  *
  *   iButton probe: DATA -> D10, with a 4.7k ohm pull-up resisor to 5V
  *                  GND  -> GND
  *
- *   Mode button: between D8 and GND (uses internal pull-up)
+ *   Mode button: between D2 and GND (uses internal pull-up).
+ *                D2 is INT0, the Nano/Uno hardware interrupt pin, so the
+ *                press is caught instantly even while the LCD delays run.
  *
  *   Built-in LED (D13) is used as a read/write activity blink.
  * ------------------------------------------------------------
@@ -46,9 +48,9 @@
 
 // ---- Pins ----
 #define IBUTTON_PIN 10   // = digital pin 10 on Uno/Nano
-#define BUTTON_PIN  8    // mode toggle button -> GND
-// LCD: RS, E, D4, D5, D6, D7
-LiquidCrystal lcd(12, 11, 5, 4, 3, 2);
+#define BUTTON_PIN  2    // mode toggle button -> GND (D2 = INT0 hardware interrupt)
+// LCD: RS, E, D4, D5, D6, D7   (D7 moved from D2 to D8 to free INT0)
+LiquidCrystal lcd(12, 11, 6, 5, 4, 3);
 
 iButtonTag ibutton(IBUTTON_PIN);
 
@@ -65,13 +67,16 @@ bool  tagPresent    = false;    // READ: a tag is currently on the probe
 bool  writeWait     = false;    // WRITE: waiting for tag removal after a write
 
 // ---- Button debounce / long-press ----
-int   btnStable     = HIGH;     // debounced level (HIGH = released, pull-up)
-int   btnLastRead   = HIGH;
-unsigned long btnLastChange = 0;
-bool  btnDown       = false;    // button currently held (debounced)
-unsigned long btnDownTime = 0;  // when the current press started
-bool  longFired     = false;    // long-press already handled for this hold
-const unsigned long BTN_DEBOUNCE_MS = 40;
+// The button sits on INT0 (D2). The ISR fires on every edge and records the
+// press/release into these volatile fields; loop() reads them to decide short
+// vs long press. Capturing the edge in the ISR means a tap is never lost while
+// doRead()/doWrite() are blocked inside their delay() calls.
+volatile bool          btnDown       = false; // button currently held (debounced)
+volatile unsigned long btnDownTime   = 0;     // millis() when the press started
+volatile bool          btnShortPend  = false; // ISR flagged a short-press release
+volatile bool          longFired     = false; // long-press already handled for this hold
+volatile unsigned long btnLastEdge   = 0;     // millis() of last accepted edge (bounce filter)
+const unsigned long BTN_DEBOUNCE_MS = 30;
 const unsigned long BTN_LONG_MS     = 1000;  // hold this long to clear memory
 
 // Button events
@@ -158,6 +163,7 @@ bool loadFromEEPROM() {
 void setup() {
   Serial.begin(9600);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), buttonISR, CHANGE);
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, LOW);
 
@@ -173,34 +179,56 @@ void setup() {
 }
 
 // ------------------------------------------------------------
-// Button: debounced short/long press detection.
-//   - Short press (released before BTN_LONG_MS) -> EV_SHORT on release.
-//   - Long press  (held past BTN_LONG_MS)       -> EV_LONG once while held.
+// Button ISR (INT0 on D2, triggered on CHANGE).
+//   Captures each edge the instant it happens. A crude time-window filter
+//   swallows contact bounce: edges arriving within BTN_DEBOUNCE_MS of the last
+//   accepted edge are ignored (a human tap is far longer than that, so no real
+//   press is lost). Note: millis() does not advance inside an ISR, but its last
+//   value is a fine timestamp for "now".
+// ------------------------------------------------------------
+void buttonISR() {
+  unsigned long now = millis();
+  if (now - btnLastEdge < BTN_DEBOUNCE_MS) return;   // ignore contact bounce
+  btnLastEdge = now;
+
+  if (digitalRead(BUTTON_PIN) == LOW) {              // pressed (pull-up -> LOW)
+    btnDown     = true;
+    btnDownTime = now;
+    longFired   = false;
+  } else {                                           // released
+    if (btnDown && !longFired) btnShortPend = true;  // short press -> handle in loop
+    btnDown = false;
+  }
+}
+
+// ------------------------------------------------------------
+// Button: turn the ISR-captured edges into short/long events.
+//   - Long press  (held past BTN_LONG_MS) -> EV_LONG once, while still held.
+//   - Short press (released before that)  -> EV_SHORT on release.
+// Reads of the multi-byte volatile are guarded so the ISR can't tear them.
 // ------------------------------------------------------------
 uint8_t buttonEvent() {
-  int reading = digitalRead(BUTTON_PIN);
-  if (reading != btnLastRead) {
-    btnLastChange = millis();
-    btnLastRead = reading;
-  }
-
-  if (millis() - btnLastChange > BTN_DEBOUNCE_MS && reading != btnStable) {
-    btnStable = reading;
-    if (btnStable == LOW) {              // pressed
-      btnDown = true;
-      btnDownTime = millis();
-      longFired = false;
-    } else {                            // released
-      bool wasShort = btnDown && !longFired;
-      btnDown = false;
-      if (wasShort) return EV_SHORT;
-    }
-  }
+  noInterrupts();
+  bool          down     = btnDown;
+  bool          lf       = longFired;
+  unsigned long downTime = btnDownTime;
+  bool          shortEv  = btnShortPend;
+  interrupts();
 
   // Fire the long-press once, while the button is still held.
-  if (btnDown && !longFired && millis() - btnDownTime > BTN_LONG_MS) {
-    longFired = true;
+  if (down && !lf && millis() - downTime > BTN_LONG_MS) {
+    noInterrupts();
+    longFired    = true;
+    btnShortPend = false;   // the eventual release must not also count as short
+    interrupts();
     return EV_LONG;
+  }
+
+  if (shortEv) {
+    noInterrupts();
+    btnShortPend = false;
+    interrupts();
+    return EV_SHORT;
   }
   return EV_NONE;
 }

@@ -6,12 +6,17 @@
  *          LiquidCrystal (built-in)
  *
  * FUNCTION
- *   READ mode : continuously reads any iButton touched to the probe,
- *               saves the code (RAM + EEPROM) and flashes it on the LCD.
- *   WRITE mode: auto-clones the saved code onto any WRITABLE iButton
- *               (RW1990 / RW2004 / TM01 ...) the moment it touches the probe.
- *   Button   : short press toggles READ/WRITE; long press (1s) clears
- *               the saved code from RAM and EEPROM.
+ *   The device holds NUM_SLOTS independent memory slots. The button selects
+ *   which slot is active; the slot's contents decide what the slot does:
+ *
+ *     empty slot  -> READ  : reads any iButton touched to the probe and
+ *                            stores its code into the active slot.
+ *     filled slot -> WRITE : auto-clones the slot's code onto any WRITABLE
+ *                            iButton (RW1990 / RW2004 / TM01 ...) touched.
+ *
+ *   Button   : short press  -> select the next slot (wraps around);
+ *              long press (1s) -> clear the active slot (RAM + EEPROM),
+ *                                 which turns it back into a READ slot.
  *
  * ------------------------------------------------------------
  * WIRING (bare 16-pin 1602A, 4-bit parallel)
@@ -34,7 +39,7 @@
  *   iButton probe: DATA -> D10, with a 4.7k ohm pull-up resisor to 5V
  *                  GND  -> GND
  *
- *   Mode button: between D2 and GND (uses internal pull-up).
+ *   Slot button: between D2 and GND (uses internal pull-up).
  *                D2 is INT0, the Nano/Uno hardware interrupt pin, so the
  *                press is caught instantly even while the LCD delays run.
  *
@@ -46,24 +51,31 @@
 #include <LiquidCrystal.h>
 #include <EEPROM.h>
 
+// ---- Config ----
+#define NUM_SLOTS 5      // number of memory slots the button cycles through
+
 // ---- Pins ----
 #define IBUTTON_PIN 10   // = digital pin 10 on Uno/Nano
-#define BUTTON_PIN  2    // mode toggle button -> GND (D2 = INT0 hardware interrupt)
+#define BUTTON_PIN  2    // slot select button -> GND (D2 = INT0 hardware interrupt)
 LiquidCrystal lcd(12, 11, 6, 5, 4, 3);
 
 iButtonTag ibutton(IBUTTON_PIN);
 
 // ---- EEPROM layout ----
-#define EE_MAGIC_ADDR 0
-#define EE_CODE_ADDR  1
-#define EE_MAGIC      0xB7   // marker: a valid saved code lives in EEPROM
+// Each slot is stored as [magic][8 code bytes]. A slot whose magic byte is not
+// EE_SLOT_MAGIC is considered empty. Slot i starts at i * EE_SLOT_SIZE.
+#define EE_SLOT_MAGIC 0xB7
+#define EE_SLOT_SIZE  9    // 1 magic byte + 8 code bytes
 
 // ---- State ----
-iButtonCode savedCode;          // last read / stored code (uint8_t[8])
-bool  haveSaved     = false;    // is savedCode valid?
-bool  writeMode     = false;    // false = READ, true = WRITE
-bool  tagPresent    = false;    // READ: a tag is currently on the probe
-bool  writeWait     = false;    // WRITE: waiting for tag removal after a write
+iButtonCode savedCode[NUM_SLOTS];        // code stored in each slot (uint8_t[8])
+bool  haveSaved[NUM_SLOTS];              // is the slot's code valid?
+uint8_t curSlot     = 0;                 // currently selected slot (0..NUM_SLOTS-1)
+bool  tagPresent    = false;             // READ: a tag is currently on the probe
+bool  writeWait     = false;             // WRITE: waiting for tag removal after a write
+
+// A slot with a stored code is a WRITE slot; an empty slot is a READ slot.
+inline bool writeMode() { return haveSaved[curSlot]; }
 
 // ---- Button debounce / long-press ----
 // The button sits on INT0 (D2). The ISR fires on every edge and records the
@@ -76,12 +88,12 @@ volatile bool          btnShortPend  = false; // ISR flagged a short-press relea
 volatile bool          longFired     = false; // long-press already handled for this hold
 volatile unsigned long btnLastEdge   = 0;     // millis() of last accepted edge (bounce filter)
 const unsigned long BTN_DEBOUNCE_MS = 30;
-const unsigned long BTN_LONG_MS     = 1000;  // hold this long to clear memory
+const unsigned long BTN_LONG_MS     = 500;  // hold this long to clear the slot
 
 // Button events
 #define EV_NONE  0
-#define EV_SHORT 1   // short press -> toggle mode
-#define EV_LONG  2   // long press  -> clear saved code
+#define EV_SHORT 1   // short press -> select next slot
+#define EV_LONG  2   // long press  -> clear active slot
 
 // ------------------------------------------------------------
 // Helpers
@@ -97,42 +109,47 @@ void codeToHex(iButtonCode code, char *buf) {
   buf[16] = '\0';
 }
 
-// Draw line 0 = mode + status, line 1 = saved code (or a placeholder).
+// Draw line 0 = slot + mode + status, line 1 = active slot's code (or a placeholder).
 void drawScreen(const char *status) {
   char line[17];
 
-  // Line 0: mode on the left, status right-aligned.
+  // Line 0: "<slot> <mode>" on the left, status right-aligned.
   memset(line, ' ', 16);
   line[16] = '\0';
 
   uint8_t slen = (status && *status) ? strlen(status) : 0;
   if (slen > 16) slen = 16;
 
-  const char *mode = writeMode ? "WRITE" : "READ";
-  uint8_t mlen = strlen(mode);
+  // Left label e.g. "1/5 WRITE"
+  char label[13];
+  snprintf(label, sizeof(label), "%u/%u %s",
+           (unsigned)(curSlot + 1), (unsigned)NUM_SLOTS,
+           writeMode() ? "WRITE" : "READ");
+  uint8_t llen = strlen(label);
+  if (llen > 16) llen = 16;
 
-  // Show the mode label only if it doesn't collide with the status
-  // (needs at least a 1-char gap). Otherwise the status gets the whole row.
-  if (mlen + 1 + slen <= 16) memcpy(line, mode, mlen);
+  // Show the label only if it doesn't collide with the status (needs at least a
+  // 1-char gap). Otherwise the status gets the whole row.
+  if (llen + 1 + slen <= 16) memcpy(line, label, llen);
   if (slen) memcpy(line + (16 - slen), status, slen);   // right-aligned
   lcd.setCursor(0, 0);
   lcd.print(line);
 
-  // Line 1: the saved code
+  // Line 1: the active slot's code
   lcd.setCursor(0, 1);
-  if (haveSaved) {
-    codeToHex(savedCode, line);
+  if (haveSaved[curSlot]) {
+    codeToHex(savedCode[curSlot], line);
     lcd.print(line);
   } else {
     lcd.print("  -- no code -- ");
   }
 }
 
-// Flash the code line a few times to indicate a read/write happened.
+// Flash the active slot's code line a few times to indicate a read/write happened.
 void flashCode() {
-  if (!haveSaved) return;
+  if (!haveSaved[curSlot]) return;
   char hex[17];
-  codeToHex(savedCode, hex);
+  codeToHex(savedCode[curSlot], hex);
   for (uint8_t i = 0; i < 3; i++) {
     lcd.setCursor(0, 1);
     lcd.print("                ");   // blank the row
@@ -145,15 +162,19 @@ void flashCode() {
   }
 }
 
-void saveToEEPROM() {
-  EEPROM.update(EE_MAGIC_ADDR, EE_MAGIC);
-  for (uint8_t i = 0; i < 8; i++) EEPROM.update(EE_CODE_ADDR + i, savedCode[i]);
+uint16_t slotAddr(uint8_t slot) { return (uint16_t)slot * EE_SLOT_SIZE; }
+
+void saveSlotToEEPROM(uint8_t slot) {
+  uint16_t addr = slotAddr(slot);
+  EEPROM.update(addr, EE_SLOT_MAGIC);
+  for (uint8_t i = 0; i < 8; i++) EEPROM.update(addr + 1 + i, savedCode[slot][i]);
 }
 
-bool loadFromEEPROM() {
-  if (EEPROM.read(EE_MAGIC_ADDR) != EE_MAGIC) return false;
-  for (uint8_t i = 0; i < 8; i++) savedCode[i] = EEPROM.read(EE_CODE_ADDR + i);
-  return ibutton.testCode(savedCode) == 1;   // 1 = structurally valid
+bool loadSlotFromEEPROM(uint8_t slot) {
+  uint16_t addr = slotAddr(slot);
+  if (EEPROM.read(addr) != EE_SLOT_MAGIC) return false;
+  for (uint8_t i = 0; i < 8; i++) savedCode[slot][i] = EEPROM.read(addr + 1 + i);
+  return ibutton.testCode(savedCode[slot]) == 1;   // 1 = structurally valid
 }
 
 // ------------------------------------------------------------
@@ -172,9 +193,11 @@ void setup() {
   lcd.print("  reader/cloner");
   delay(1000);
 
-  haveSaved = loadFromEEPROM();
+  for (uint8_t s = 0; s < NUM_SLOTS; s++) haveSaved[s] = loadSlotFromEEPROM(s);
+  curSlot = 0;
+
   lcd.clear();
-  drawScreen(haveSaved ? "ready" : "no code");
+  drawScreen("ready");
 }
 
 // ------------------------------------------------------------
@@ -218,7 +241,7 @@ uint8_t buttonEvent() {
   // swallow the release edge of a quick tap (if it lands within
   // BTN_DEBOUNCE_MS of the press), leaving btnDown stuck true. Left alone,
   // the timer below would then mistake that tap for a 1s hold and wrongly
-  // clear memory. If we think the button is held but the pin has actually
+  // clear the slot. If we think the button is held but the pin has actually
   // gone high, the release was missed: drop the stuck state and treat it as
   // the short press it was.
   if (down && digitalRead(BUTTON_PIN) == HIGH) {
@@ -247,25 +270,34 @@ uint8_t buttonEvent() {
   return EV_NONE;
 }
 
-// Wipe the saved code from RAM and invalidate it in EEPROM.
-void clearMemory() {
-  EEPROM.update(EE_MAGIC_ADDR, 0xFF);   // invalidate the marker
-  memset(savedCode, 0, 8);
-  haveSaved  = false;
+// Select the next slot (wraps around) and reset the per-slot activity state.
+void nextSlot() {
+  curSlot = (curSlot + 1) % NUM_SLOTS;
   tagPresent = false;
   writeWait  = false;
-  Serial.println("Memory cleared");
+  drawScreen("ready");
+}
+
+// Wipe the active slot's code from RAM and invalidate it in EEPROM.
+// This turns the slot back into a READ slot.
+void clearSlot() {
+  EEPROM.update(slotAddr(curSlot), 0xFF);   // invalidate the marker
+  memset(savedCode[curSlot], 0, 8);
+  haveSaved[curSlot] = false;
+  tagPresent = false;
+  writeWait  = false;
+  Serial.print("Slot "); Serial.print(curSlot + 1); Serial.println(" cleared");
 
   drawScreen("cleared");
   digitalWrite(LED_BUILTIN, HIGH);
   delay(500);
   digitalWrite(LED_BUILTIN, LOW);
   delay(600);
-  drawScreen("no code");
+  drawScreen("ready");
 }
 
 // ------------------------------------------------------------
-// READ mode
+// READ mode  (active slot is empty -> capture a code into it)
 // ------------------------------------------------------------
 void doRead() {
   iButtonCode code;
@@ -274,11 +306,11 @@ void doRead() {
   if (status == 1) {                 // valid code on the probe
     if (!tagPresent) {               // new contact -> capture it once
       tagPresent = true;
-      memcpy(savedCode, code, 8);
-      haveSaved = true;
-      saveToEEPROM();
+      memcpy(savedCode[curSlot], code, 8);
+      haveSaved[curSlot] = true;     // slot now filled -> becomes a WRITE slot
+      saveSlotToEEPROM(curSlot);
 
-      Serial.print("Read: ");
+      Serial.print("Read into slot "); Serial.print(curSlot + 1); Serial.print(": ");
       ibutton.printCode(code);
       Serial.println();
 
@@ -298,15 +330,9 @@ void doRead() {
 }
 
 // ------------------------------------------------------------
-// WRITE mode  (auto-clone saved code onto a writable tag)
+// WRITE mode  (active slot filled -> auto-clone its code onto a writable tag)
 // ------------------------------------------------------------
 void doWrite() {
-  if (!haveSaved) {
-    drawScreen("no code");
-    delay(200);
-    return;
-  }
-
   // After a write, wait until the tag is lifted before writing again.
   if (writeWait) {
     iButtonCode tmp;
@@ -318,10 +344,10 @@ void doWrite() {
     return;
   }
 
-  int8_t r = ibutton.writeCode(savedCode);   // auto-detect writable type
+  int8_t r = ibutton.writeCode(savedCode[curSlot]);   // auto-detect writable type
 
   if (r == 1) {                    // success
-    Serial.println("Write OK");
+    Serial.print("Write OK from slot "); Serial.println(curSlot + 1);
     drawScreen("OK!");
     flashCode();
     writeWait = true;
@@ -347,14 +373,11 @@ void doWrite() {
 void loop() {
   uint8_t ev = buttonEvent();
   if (ev == EV_LONG) {
-    clearMemory();
+    clearSlot();
   } else if (ev == EV_SHORT) {
-    writeMode  = !writeMode;
-    tagPresent = false;
-    writeWait  = false;
-    drawScreen("ready");
+    nextSlot();
   }
 
-  if (writeMode) doWrite();
-  else           doRead();
+  if (writeMode()) doWrite();
+  else             doRead();
 }

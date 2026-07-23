@@ -49,7 +49,6 @@
 // ---- Pins ----
 #define IBUTTON_PIN 10   // = digital pin 10 on Uno/Nano
 #define BUTTON_PIN  2    // mode toggle button -> GND (D2 = INT0 hardware interrupt)
-// LCD: RS, E, D4, D5, D6, D7   (D7 moved from D2 to D8 to free INT0)
 LiquidCrystal lcd(12, 11, 6, 5, 4, 3);
 
 iButtonTag ibutton(IBUTTON_PIN);
@@ -214,6 +213,21 @@ uint8_t buttonEvent() {
   unsigned long downTime = btnDownTime;
   bool          shortEv  = btnShortPend;
   interrupts();
+
+  // Ground-truth check against the pin. The ISR's time-window debounce can
+  // swallow the release edge of a quick tap (if it lands within
+  // BTN_DEBOUNCE_MS of the press), leaving btnDown stuck true. Left alone,
+  // the timer below would then mistake that tap for a 1s hold and wrongly
+  // clear memory. If we think the button is held but the pin has actually
+  // gone high, the release was missed: drop the stuck state and treat it as
+  // the short press it was.
+  if (down && digitalRead(BUTTON_PIN) == HIGH) {
+    noInterrupts();
+    btnDown = false;
+    interrupts();
+    down = false;
+    if (!lf && !shortEv) shortEv = true;   // recover the missed short-press
+  }
 
   // Fire the long-press once, while the button is still held.
   if (down && !lf && millis() - downTime > BTN_LONG_MS) {

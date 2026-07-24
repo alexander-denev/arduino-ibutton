@@ -145,23 +145,6 @@ void drawScreen(const char *status) {
   }
 }
 
-// Flash the active slot's code line a few times to indicate a read/write happened.
-void flashCode() {
-  if (!haveSaved[curSlot]) return;
-  char hex[17];
-  codeToHex(savedCode[curSlot], hex);
-  for (uint8_t i = 0; i < 3; i++) {
-    lcd.setCursor(0, 1);
-    lcd.print("                ");   // blank the row
-    digitalWrite(LED_BUILTIN, HIGH);
-    delay(120);
-    lcd.setCursor(0, 1);
-    lcd.print(hex);
-    digitalWrite(LED_BUILTIN, LOW);
-    delay(160);
-  }
-}
-
 uint16_t slotAddr(uint8_t slot) { return (uint16_t)slot * EE_SLOT_SIZE; }
 
 void saveSlotToEEPROM(uint8_t slot) {
@@ -315,7 +298,6 @@ void doRead() {
       Serial.println();
 
       drawScreen("saved");
-      flashCode();
       drawScreen("ready");
     }
   } else if (status == 0) {          // nothing on the probe
@@ -349,7 +331,6 @@ void doWrite() {
   if (r == 1) {                    // success
     Serial.print("Write OK from slot "); Serial.println(curSlot + 1);
     drawScreen("OK!");
-    flashCode();
     writeWait = true;
   } else if (r == 0) {             // no tag present yet -> keep waiting quietly
     // nothing

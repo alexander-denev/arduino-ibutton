@@ -92,7 +92,7 @@ volatile unsigned long btnDownTime   = 0;     // millis() when the press started
 volatile bool          btnShortPend  = false; // ISR flagged a short-press release
 volatile bool          longFired     = false; // long-press already handled for this hold
 volatile unsigned long btnLastEdge   = 0;     // millis() of last accepted edge (bounce filter)
-const unsigned long BTN_DEBOUNCE_MS = 30;
+const unsigned long BTN_DEBOUNCE_MS = 50;
 const unsigned long BTN_LONG_MS     = 500;  // hold this long to clear the slot
 
 // Button events
@@ -223,8 +223,6 @@ void setup() {
   Serial.begin(9600);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), buttonISR, CHANGE);
-  pinMode(LED_BUILTIN, OUTPUT);
-  digitalWrite(LED_BUILTIN, LOW);
   pinMode(BUZZER_PIN, OUTPUT);
 
   lcd.begin(16, 2);
@@ -332,10 +330,7 @@ void clearSlot() {
 
   drawScreen("cleared");
   toneClear();
-  digitalWrite(LED_BUILTIN, HIGH);
   delay(500);
-  digitalWrite(LED_BUILTIN, LOW);
-  delay(600);
   drawScreen("ready");
 }
 

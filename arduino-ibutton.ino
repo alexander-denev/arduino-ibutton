@@ -332,6 +332,24 @@ void clearSlot() {
   toneClear();
   delay(500);
   drawScreen("ready");
+
+  // A worn button often chatters for a while after being released from a
+  // long hold. If that chatter arrives more than BTN_DEBOUNCE_MS after the
+  // real release edge, buttonISR() reads it as a brand-new press (which
+  // also resets longFired to false), and the bounce's matching release then
+  // queues a short press -> the slot changes right after the clear. Detach
+  // the interrupt and wait for the pin to sit steady-high before listening
+  // again, so none of that chatter can be mistaken for a fresh click.
+  detachInterrupt(digitalPinToInterrupt(BUTTON_PIN));
+  unsigned long stableSince = millis();
+  while (millis() - stableSince < BTN_DEBOUNCE_MS) {
+    if (digitalRead(BUTTON_PIN) == LOW) stableSince = millis();  // still held / still bouncing
+  }
+  btnDown      = false;
+  btnShortPend = false;
+  longFired    = false;
+  btnLastEdge  = millis();
+  attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), buttonISR, CHANGE);
 }
 
 // ------------------------------------------------------------

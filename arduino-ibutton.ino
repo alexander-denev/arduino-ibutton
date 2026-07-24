@@ -43,6 +43,9 @@
  *                D2 is INT0, the Nano/Uno hardware interrupt pin, so the
  *                press is caught instantly even while the LCD delays run.
  *
+ *   Passive buzzer: + -> D9, - -> GND. Gives an audible tone on boot, read,
+ *                    write, clear and slot-change.
+ *
  *   Built-in LED (D13) is used as a read/write activity blink.
  * ------------------------------------------------------------
  */
@@ -57,6 +60,7 @@
 // ---- Pins ----
 #define IBUTTON_PIN 10   // = digital pin 10 on Uno/Nano
 #define BUTTON_PIN  2    // slot select button -> GND (D2 = INT0 hardware interrupt)
+#define BUZZER_PIN  9    // passive buzzer +, driven with tone()
 LiquidCrystal lcd(12, 11, 6, 5, 4, 3);
 
 iButtonTag ibutton(IBUTTON_PIN);
@@ -72,7 +76,8 @@ iButtonCode savedCode[NUM_SLOTS];        // code stored in each slot (uint8_t[8]
 bool  haveSaved[NUM_SLOTS];              // is the slot's code valid?
 uint8_t curSlot     = 0;                 // currently selected slot (0..NUM_SLOTS-1)
 bool  tagPresent    = false;             // READ: a tag is currently on the probe
-bool  writeWait     = false;             // WRITE: waiting for tag removal after a write
+bool  waitForLift   = false;             // an action just completed; wait for the
+                                          // tag to be lifted before doing another
 
 // A slot with a stored code is a WRITE slot; an empty slot is a READ slot.
 inline bool writeMode() { return haveSaved[curSlot]; }
@@ -145,6 +150,57 @@ void drawScreen(const char *status) {
   }
 }
 
+// ------------------------------------------------------------
+// Buzzer tones - one function per event so each sequence can be tweaked
+// independently. All are blocking (tone() + delay()), matching the rest of
+// the sketch's blocking style; the button ISR still catches presses made
+// during the sound.
+// ------------------------------------------------------------
+void toneBoot() {
+  tone(BUZZER_PIN, 1047, 80);   // C6
+  delay(100);
+  tone(BUZZER_PIN, 1319, 80);   // E6
+  delay(100);
+  tone(BUZZER_PIN, 1568, 120);  // G6
+  delay(140);
+}
+
+void toneRead() {
+  tone(BUZZER_PIN, 2093, 80);   // C7
+  delay(90);
+}
+
+void toneWrite() {
+  tone(BUZZER_PIN, 1568, 70);   // G6
+  delay(90);
+  tone(BUZZER_PIN, 2093, 70);   // C7
+  delay(90);
+}
+
+void toneClear() {
+  tone(BUZZER_PIN, 784, 150);   // G5
+  delay(170);
+  tone(BUZZER_PIN, 523, 220);   // C5
+  delay(240);
+}
+
+void toneSlotChange() {
+  tone(BUZZER_PIN, 1200, 40);
+  delay(50);
+}
+
+void toneReadFail() {
+  tone(BUZZER_PIN, 220, 150);   // A3
+  delay(170);
+}
+
+void toneWriteFail() {
+  tone(BUZZER_PIN, 220, 120);   // A3
+  delay(140);
+  tone(BUZZER_PIN, 220, 120);
+  delay(140);
+}
+
 uint16_t slotAddr(uint8_t slot) { return (uint16_t)slot * EE_SLOT_SIZE; }
 
 void saveSlotToEEPROM(uint8_t slot) {
@@ -169,11 +225,13 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), buttonISR, CHANGE);
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, LOW);
+  pinMode(BUZZER_PIN, OUTPUT);
 
   lcd.begin(16, 2);
   lcd.print("  ibutton I/O");
   lcd.setCursor(0, 1);
   lcd.print("  reader/cloner");
+  toneBoot();
   delay(1000);
 
   for (uint8_t s = 0; s < NUM_SLOTS; s++) haveSaved[s] = loadSlotFromEEPROM(s);
@@ -256,8 +314,9 @@ uint8_t buttonEvent() {
 // Select the next slot (wraps around) and reset the per-slot activity state.
 void nextSlot() {
   curSlot = (curSlot + 1) % NUM_SLOTS;
-  tagPresent = false;
-  writeWait  = false;
+  tagPresent  = false;
+  waitForLift = false;
+  toneSlotChange();
   drawScreen("ready");
 }
 
@@ -267,11 +326,12 @@ void clearSlot() {
   EEPROM.update(slotAddr(curSlot), 0xFF);   // invalidate the marker
   memset(savedCode[curSlot], 0, 8);
   haveSaved[curSlot] = false;
-  tagPresent = false;
-  writeWait  = false;
+  tagPresent  = false;
+  waitForLift = false;
   Serial.print("Slot "); Serial.print(curSlot + 1); Serial.println(" cleared");
 
   drawScreen("cleared");
+  toneClear();
   digitalWrite(LED_BUILTIN, HIGH);
   delay(500);
   digitalWrite(LED_BUILTIN, LOW);
@@ -298,13 +358,15 @@ void doRead() {
       Serial.println();
 
       drawScreen("saved");
-      drawScreen("ready");
+      toneRead();
+      waitForLift = true;            // require lift before the new WRITE mode acts
     }
   } else if (status == 0) {          // nothing on the probe
     tagPresent = false;
   } else if (!tagPresent) {          // -1 bad checksum / -2 all zero
     tagPresent = true;               // a tag responded but is unreadable
     drawScreen(status == -1 ? "bad crc" : "empty");
+    toneReadFail();
     delay(600);
     drawScreen("ready");
   }
@@ -315,23 +377,13 @@ void doRead() {
 // WRITE mode  (active slot filled -> auto-clone its code onto a writable tag)
 // ------------------------------------------------------------
 void doWrite() {
-  // After a write, wait until the tag is lifted before writing again.
-  if (writeWait) {
-    iButtonCode tmp;
-    if (ibutton.readCode(tmp) == 0) {
-      writeWait = false;
-      drawScreen("ready");
-    }
-    delay(100);
-    return;
-  }
-
   int8_t r = ibutton.writeCode(savedCode[curSlot]);   // auto-detect writable type
 
   if (r == 1) {                    // success
     Serial.print("Write OK from slot "); Serial.println(curSlot + 1);
     drawScreen("OK!");
-    writeWait = true;
+    toneWrite();
+    waitForLift = true;
   } else if (r == 0) {             // no tag present yet -> keep waiting quietly
     // nothing
   } else {                         // some failure
@@ -341,9 +393,10 @@ void doWrite() {
     else                msg = "write fail"; // -21..-29 write problem
     Serial.print("Write err "); Serial.println(r);
     drawScreen(msg);
+    toneWriteFail();
     delay(1000);
     drawScreen("ready");
-    writeWait = true;             // require removal before retrying
+    waitForLift = true;           // require removal before retrying
   }
   delay(60);
 }
@@ -357,6 +410,20 @@ void loop() {
     clearSlot();
   } else if (ev == EV_SHORT) {
     nextSlot();
+  }
+
+  // An action (read/write) just completed: hold off on the next one until
+  // the iButton is actually lifted off the probe, so the user has time to
+  // remove it instead of the next action firing instantly on the same tag.
+  if (waitForLift) {
+    iButtonCode tmp;
+    if (ibutton.readCode(tmp) == 0) {
+      waitForLift = false;
+      tagPresent  = false;
+      drawScreen("ready");
+    }
+    delay(100);
+    return;
   }
 
   if (writeMode()) doWrite();

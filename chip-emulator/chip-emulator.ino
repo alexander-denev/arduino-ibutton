@@ -56,7 +56,21 @@ auto hub = OneWireHub(PIN_ONEWIRE);
 auto key = DS2401(0x01, 0x30, 0x48, 0xC8, 0x01, 0x00, 0x00);
 
 void setup() {
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, LOW);
   hub.attach(key);
+
+  // Flash light in groups (1, 2, 3)
+  const uint8_t blinkCounts[] = {1, 2, 3};
+  for (uint8_t group = 0; group < 3; group++) {
+    for (uint8_t blink = 0; blink < blinkCounts[group]; blink++) {
+      digitalWrite(LED_BUILTIN, HIGH);
+      delay(50);
+      digitalWrite(LED_BUILTIN, LOW);
+      delay(50);
+    }
+    delay(250);   // extra pause between groups (300ms total gap)
+  }
 }
 
 void loop() {
